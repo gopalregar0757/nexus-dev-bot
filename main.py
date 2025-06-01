@@ -26,6 +26,9 @@ c.execute('''CREATE TABLE IF NOT EXISTS tickets
               ticket_type TEXT,
               assigned_to INTEGER,
               priority TEXT)''')
+c.execute('''CREATE TABLE IF NOT EXISTS guild_config
+             (guild_id INTEGER PRIMARY KEY,
+              ticket_role_id INTEGER)''')
 conn.commit()
 
 # Configuration
@@ -54,6 +57,15 @@ class TicketModal(ui.Modal, title="Create Support Ticket"):
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+        
+        # Check if user has ticket creation permission
+        if not await has_ticket_permission(interaction):
+            await interaction.followup.send(
+                "❌ You don't have permission to create tickets!",
+                ephemeral=True
+            )
+            return
+            
         await create_ticket_channel(interaction, self.ticket_type, str(self.issue), str(self.details))
 
 class TicketTypeView(ui.View):
@@ -75,6 +87,14 @@ class TicketTypeButton(ui.Button):
         self.description = description
         
     async def callback(self, interaction: discord.Interaction):
+        # Check if user has ticket creation permission
+        if not await has_ticket_permission(interaction):
+            await interaction.response.send_message(
+                "❌ You don't have permission to create tickets!",
+                ephemeral=True
+            )
+            return
+            
         await interaction.response.send_modal(TicketModal(self.ticket_type))
 
 @bot.event
@@ -86,7 +106,25 @@ async def on_ready():
     ))
     bot.add_view(TicketManagementView())
     bot.add_view(TicketTypeView())
+    bot.add_view(PriorityView())
     await bot.tree.sync()
+
+async def has_ticket_permission(interaction: discord.Interaction) -> bool:
+    """Check if user has permission to create tickets"""
+    # Allow administrators regardless of role
+    if interaction.user.guild_permissions.administrator:
+        return True
+    
+    # Check database for ticket role
+    c.execute("SELECT ticket_role_id FROM guild_config WHERE guild_id=?", (interaction.guild.id,))
+    result = c.fetchone()
+    
+    if not result or not result[0]:
+        return False  # No role set, default to no access
+    
+    # Check if user has the role
+    ticket_role = interaction.guild.get_role(result[0])
+    return ticket_role in interaction.user.roles if ticket_role else False
 
 async def create_ticket_channel(interaction: discord.Interaction, ticket_type: str, issue: str, details: str):
     # Get or create category
@@ -138,7 +176,7 @@ async def create_ticket_channel(interaction: discord.Interaction, ticket_type: s
     
     # Send confirmation
     await interaction.followup.send(
-        f"Ticket created: {channel.mention}",
+        f"🎫 Ticket created: {channel.mention}",
         ephemeral=True
     )
     
@@ -159,11 +197,14 @@ class TicketManagementView(ui.View):
         # Update embed
         embed = interaction.message.embeds[0]
         embed.set_field_at(2, name="Status", value="🟡 Claimed", inline=True)
-        embed.set_field_at(3, name="Assigned To", value=interaction.user.mention, inline=True)
+        if len(embed.fields) > 3:
+            embed.set_field_at(3, name="Assigned To", value=interaction.user.mention, inline=True)
+        else:
+            embed.add_field(name="Assigned To", value=interaction.user.mention, inline=True)
         await interaction.message.edit(embed=embed)
         
         await interaction.response.send_message(
-            f"{interaction.user.mention} has claimed this ticket",
+            f"✅ {interaction.user.mention} has claimed this ticket",
             allowed_mentions=discord.AllowedMentions.none()
         )
         
@@ -196,12 +237,12 @@ class TicketManagementView(ui.View):
         log_channel = bot.get_channel(LOG_CHANNEL_ID)
         if log_channel:
             await log_channel.send(
-                f"Ticket closed by {interaction.user.mention}",
+                f"📂 Ticket closed by {interaction.user.mention}",
                 file=discord.File(transcript, filename=f"transcript-{interaction.channel.name}.txt")
             )
         
         # Notify user
-        await interaction.response.send_message("Closing ticket in 10 seconds...")
+        await interaction.response.send_message("🔒 Closing ticket in 10 seconds...")
         await asyncio.sleep(10)
         await interaction.channel.delete(reason="Ticket closed")
         
@@ -209,25 +250,38 @@ class TicketManagementView(ui.View):
         await log_action(f"Ticket closed by {interaction.user} in #{interaction.channel.name}")
 
 class AddUserModal(ui.Modal, title="Add User to Ticket"):
-    user = ui.TextInput(label="User ID or Mention", style=discord.TextStyle.short)
+    user = ui.TextInput(label="User ID, @Mention, or Name", style=discord.TextStyle.short)
     
     async def on_submit(self, interaction: discord.Interaction):
         try:
             # Try to convert to user ID
-            user_id = int(str(self.user).strip().replace("<@", "").replace(">", ""))
-            user = interaction.guild.get_member(user_id)
+            user_input = str(self.user).strip()
+            
+            # Check for mention format
+            if user_input.startswith("<@") and user_input.endswith(">"):
+                user_id = int(user_input[2:-1])
+                user = interaction.guild.get_member(user_id)
+            # Check for username
+            elif user_input.isdigit():
+                user = interaction.guild.get_member(int(user_input))
+            else:
+                # Search by name
+                user = discord.utils.find(
+                    lambda m: user_input.lower() in m.display_name.lower() or user_input.lower() in m.name.lower(),
+                    interaction.guild.members
+                )
             
             if not user:
-                await interaction.response.send_message("User not found!", ephemeral=True)
+                await interaction.response.send_message("❌ User not found!", ephemeral=True)
                 return
                 
             await interaction.channel.set_permissions(user, read_messages=True, send_messages=True)
             await interaction.response.send_message(
-                f"{user.mention} has been added to the ticket",
+                f"✅ {user.mention} has been added to the ticket",
                 allowed_mentions=discord.AllowedMentions.none()
             )
         except ValueError:
-            await interaction.response.send_message("Invalid user format! Use ID or mention", ephemeral=True)
+            await interaction.response.send_message("❌ Invalid user format! Use ID, mention, or name", ephemeral=True)
 
 class PriorityView(ui.View):
     def __init__(self):
@@ -254,18 +308,18 @@ class PriorityButton(ui.Button):
         # Update embed
         embed = interaction.message.embeds[0] if interaction.message.embeds else None
         if not embed:
-            await interaction.response.send_message("Couldn't find ticket info!", ephemeral=True)
+            await interaction.response.send_message("❌ Couldn't find ticket info!", ephemeral=True)
             return
             
         # Find priority field index
         for i, field in enumerate(embed.fields):
             if field.name == "Priority":
-                embed.set_field_at(i, name="Priority", value=self.view.children[0].label, inline=True)
+                embed.set_field_at(i, name="Priority", value=self.label, inline=True)
                 break
         
         await interaction.message.edit(embed=embed)
         await interaction.response.send_message(
-            f"Priority set to {self.label}",
+            f"✅ Priority set to {self.label}",
             ephemeral=True
         )
 
@@ -275,6 +329,8 @@ async def create_transcript(channel):
         content = message.content
         if message.embeds:
             content += "\n[Embed Content]"
+        if message.attachments:
+            content += "\n" + "\n".join([a.url for a in message.attachments])
         transcript.append(f"{message.created_at} - {message.author.display_name}: {content}")
     
     filename = f"{channel.id}.txt"
@@ -298,6 +354,20 @@ def get_next_ticket_number():
     count = c.fetchone()[0]
     return count + 1
 
+@bot.tree.command(name="set-ticket-role", description="Set which role can create tickets (Admin only)")
+@commands.has_permissions(administrator=True)
+async def set_ticket_role(interaction: discord.Interaction, role: discord.Role):
+    # Save to database
+    c.execute("INSERT OR REPLACE INTO guild_config (guild_id, ticket_role_id) VALUES (?, ?)",
+              (interaction.guild.id, role.id))
+    conn.commit()
+    
+    await interaction.response.send_message(
+        f"✅ Ticket creation role set to {role.mention}",
+        ephemeral=True
+    )
+    await log_action(f"Ticket role set to {role.name} by {interaction.user}")
+
 @bot.tree.command(name="ticketpanel", description="Setup ticket creation panel (Admin only)")
 @commands.has_permissions(administrator=True)
 async def ticket_panel(interaction: discord.Interaction):
@@ -312,14 +382,26 @@ async def ticket_panel(interaction: discord.Interaction):
             value=description,
             inline=False
         )
+    
+    # Show current ticket role
+    c.execute("SELECT ticket_role_id FROM guild_config WHERE guild_id=?", (interaction.guild.id,))
+    result = c.fetchone()
+    role_mention = f"<@&{result[0]}>" if result and result[0] else "Not set"
+    
+    embed.add_field(
+        name="Permission",
+        value=f"Only {role_mention} can create tickets",
+        inline=False
+    )
     embed.set_footer(text="Our team will respond within 24 hours")
     
-    await interation.response.send_message(
+    await interaction.response.send_message(
         embed=embed,
         view=TicketTypeView()
     )
 
 @bot.tree.command(name="ticketstats", description="Show ticket statistics")
+@commands.has_permissions(manage_guild=True)
 async def ticket_stats(interaction: discord.Interaction):
     # Get stats from database
     c.execute("SELECT status, COUNT(*) FROM tickets GROUP BY status")
@@ -344,7 +426,44 @@ async def ticket_stats(interaction: discord.Interaction):
                           for ttype, count in type_counts.items()])
     embed.add_field(name="Ticket Types", value=type_text, inline=False)
     
+    # Open tickets
+    c.execute("SELECT COUNT(*) FROM tickets WHERE status = 'open'")
+    open_count = c.fetchone()[0]
+    embed.add_field(name="Open Tickets", value=str(open_count), inline=True)
+    
+    # Claimed tickets
+    c.execute("SELECT COUNT(*) FROM tickets WHERE status = 'claimed'")
+    claimed_count = c.fetchone()[0]
+    embed.add_field(name="Claimed Tickets", value=str(claimed_count), inline=True)
+    
     await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="forceclose", description="Force close a ticket (Admin only)")
+@commands.has_permissions(administrator=True)
+async def force_close(interaction: discord.Interaction, reason: str = "Admin closure"):
+    if "ticket" not in interaction.channel.name:
+        await interaction.response.send_message("❌ This is not a ticket channel!", ephemeral=True)
+        return
+        
+    # Update database
+    c.execute("UPDATE tickets SET status = ? WHERE channel_id = ?",
+              ("closed", interaction.channel.id))
+    conn.commit()
+    
+    # Create transcript
+    transcript = await create_transcript(interaction.channel)
+    
+    # Send to log channel
+    log_channel = bot.get_channel(LOG_CHANNEL_ID)
+    if log_channel:
+        await log_channel.send(
+            f"📂 Ticket force-closed by {interaction.user.mention}\nReason: {reason}",
+            file=discord.File(transcript, filename=f"transcript-{interaction.channel.name}.txt")
+        )
+    
+    # Delete channel
+    await interaction.response.send_message("🔒 Closing ticket immediately...")
+    await interaction.channel.delete(reason=f"Force closed by admin: {reason}")
 
 if __name__ == "__main__":
     bot.run(os.environ["BOT_TOKEN"])
