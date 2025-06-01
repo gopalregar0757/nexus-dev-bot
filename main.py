@@ -5,13 +5,19 @@ import sqlite3
 import datetime
 import asyncio
 import os
+import sys
 
 # Initialize bot
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+try:
+    APPLICATION_ID = int(os.environ["APPLICATION_ID"])
+except (KeyError, ValueError) as e:
+    print(f"ERROR: Invalid APPLICATION_ID - {e}")
+    sys.exit(1)
 
-bot = commands.Bot(command_prefix="!", intents=intents, application_id="YOUR_APP_ID")
+bot = commands.Bot(command_prefix="!", intents=intents, application_id=APPLICATION_ID)
 
 # Database setup
 DB_PATH = os.environ.get("DB_PATH", "tickets.db")
