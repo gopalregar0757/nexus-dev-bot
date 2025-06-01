@@ -13,9 +13,10 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents, application_id="YOUR_APP_ID")
 
 # Database setup
-conn = sqlite3.connect('tickets.db')
-c = conn.cursor()
-c.execute('''CREATE TABLE IF NOT EXISTS tickets
+import os
+DB_PATH = os.environ.get("DB_PATH", "tickets.db")  # Use Railway volume path
+conn = sqlite3.connect(DB_PATH)
+conn.execute('''CREATE TABLE IF NOT EXISTS tickets
              (id INTEGER PRIMARY KEY, 
               user_id INTEGER, 
               channel_id INTEGER,
