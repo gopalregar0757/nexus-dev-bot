@@ -150,58 +150,6 @@ class EnhancedTicketView(discord.ui.View):
         super().__init__(timeout=None)
         self.add_item(EnhancedClaimButton())
 
-# Custom ticket creation modal with multiple input boxes
-class TicketCreateModal(discord.ui.Modal, title="Open a Ticket"):
-    def __init__(self):
-        super().__init__()
-        self.subject = discord.ui.TextInput(
-            label="Subject",
-            placeholder="Short title of your request",
-            max_length=100
-        )
-        self.description = discord.ui.TextInput(
-            label="Description",
-            placeholder="Explain your issue or request in detail",
-            style=discord.TextStyle.paragraph,
-            required=True
-        )
-        self.attachments = discord.ui.TextInput(
-            label="Attachment URLs (optional)",
-            placeholder="Comma-separated links",
-            required=False
-        )
-
-        self.add_item(self.subject)
-        self.add_item(self.description)
-        self.add_item(self.attachments)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        subject = self.subject.value
-        description = self.description.value
-        attachment_links = [link.strip() for link in self.attachments.value.split(',') if link.strip()] if self.attachments.value else []
-
-        embed = discord.Embed(
-            title=f"🎫 Ticket: {subject}",
-            description=description,
-            color=0x8B0000
-        )
-        if attachment_links:
-            embed.add_field(
-                name="Attachments",
-                value="\n".join(attachment_links),
-                inline=False
-            )
-        embed.set_footer(text=f"Opened by {interaction.user.name}")
-
-        # Create a private ticket channel and post embed (assume function exists)
-        await interaction.response.send_message("✅ Ticket created.", ephemeral=True)
-        # You would normally create the channel and store in DB here.
-
-# Slash command to invoke ticket modal
-@bot.tree.command(name="ticketbox", description="Create a ticket with input boxes")
-async def ticketbox(interaction: discord.Interaction):
-    await interaction.response.send_modal(TicketCreateModal())
-
 # Example command to edit a ticket title and description using a modal
 class EditTicketModal(discord.ui.Modal):
     def __init__(self, channel: discord.TextChannel):
@@ -229,11 +177,23 @@ async def editticket(interaction: discord.Interaction):
         return
     await interaction.response.send_modal(EditTicketModal(interaction.channel))
 
+# Command to list all presets
+@bot.tree.command(name="listpresets", description="List all ticket presets")
+async def list_presets(interaction: discord.Interaction):
+    c.execute("SELECT name, description FROM ticket_presets WHERE guild_id = ?", (interaction.guild.id,))
+    presets = c.fetchall()
+    if not presets:
+        await interaction.response.send_message("❌ No presets found.", ephemeral=True)
+        return
+    embed = discord.Embed(title="Available Ticket Presets", color=0x8B0000)
+    for name, desc in presets:
+        embed.add_field(name=name.capitalize(), value=desc or "No description", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 # Sync persistent view
 @bot.event
 async def on_ready():
     bot.add_view(EnhancedTicketView())
-
 
 
 # Utility functions
