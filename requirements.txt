@@ -1,2 +1,1 @@
 py-cord==2.4.1
-sqlite3
