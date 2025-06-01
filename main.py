@@ -7,7 +7,7 @@ import asyncio
 import os
 import sys
 
-load_dotenv()
+
 # Initialize bot
 intents = discord.Intents.default()
 intents.message_content = True
