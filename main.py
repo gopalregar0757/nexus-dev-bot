@@ -208,7 +208,7 @@ class AdvancedTicketModal(ui.Modal, title="Create Custom Ticket"):
                             default=field.get('default', ''),
                             style=discord.TextStyle.paragraph if field.get('long', False) else discord.TextStyle.short,
                             required=field.get('required', True)
-                        )
+                        ))
                 except json.JSONDecodeError:
                     pass
         elif panel_id:
