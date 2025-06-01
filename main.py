@@ -13,14 +13,17 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
+# Replace the environment variable loading section with:
 try:
+    # Use uppercase for all variables
     APPLICATION_ID = int(os.environ["APPLICATION_ID"])
     BOT_TOKEN = os.environ["BOT_TOKEN"]
-    SUPPORT_ROLE_ID = int(os.environ.get("SUPPORT_ROLE_ID", 0))
-    LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", 0))
+    SUPPORT_ROLE_ID = int(os.environ.get("SUPPORT_ROLE_ID", "0"))
+    LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", "0"))
 except (ValueError, KeyError) as e:
     print(f"ERROR: Environment variable issue - {e}")
     print("Required variables: APPLICATION_ID and BOT_TOKEN")
+    print("Available environment variables:", list(os.environ.keys()))
     sys.exit(1)
 
 bot = commands.Bot(command_prefix="!", intents=intents, application_id=APPLICATION_ID)
