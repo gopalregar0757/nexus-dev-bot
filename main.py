@@ -7,6 +7,7 @@ import asyncio
 import os
 import sys
 import json
+from typing import Optional, List
 
 # Initialize bot
 intents = discord.Intents.default()
@@ -30,302 +31,381 @@ bot = commands.Bot(command_prefix="!", intents=intents, application_id=APPLICATI
 
 # Database setup
 DB_PATH = os.environ.get("DB_PATH", "tickets.db")
-conn = sqlite3.connect(DB_PATH)
+conn = sqlite3.connect(DB_PATH, isolation_level=None)
 c = conn.cursor()
-c.execute('''CREATE TABLE IF NOT EXISTS tickets
-             (id INTEGER PRIMARY KEY, 
-              user_id INTEGER, 
-              channel_id INTEGER,
-              status TEXT,
-              created_at TIMESTAMP,
-              ticket_type TEXT,
-              assigned_to INTEGER,
-              priority TEXT,
-              custom_data TEXT)''')
-c.execute('''CREATE TABLE IF NOT EXISTS guild_config
-             (guild_id INTEGER PRIMARY KEY,
-              ticket_role_id INTEGER)''')
-c.execute('''CREATE TABLE IF NOT EXISTS custom_panels
-             (panel_id INTEGER PRIMARY KEY AUTOINCREMENT,
-              guild_id INTEGER NOT NULL,
-              channel_id INTEGER NOT NULL,
-              message_id INTEGER,
-              title TEXT NOT NULL,
-              description TEXT,
-              button_label TEXT,
-              button_emoji TEXT,
-              button_style TEXT)''')
+
+# Create tables with improved schema
+c.execute('''
+CREATE TABLE IF NOT EXISTS tickets (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ticket_type TEXT,
+    assigned_to INTEGER,
+    priority TEXT DEFAULT 'medium',
+    custom_data TEXT,
+    guild_id INTEGER NOT NULL
+)''')
+
+c.execute('''
+CREATE TABLE IF NOT EXISTS guild_config (
+    guild_id INTEGER PRIMARY KEY,
+    ticket_role_id INTEGER,
+    category_id INTEGER,
+    ping_role_id INTEGER
+)''')
+
+c.execute('''
+CREATE TABLE IF NOT EXISTS custom_panels (
+    panel_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    message_id INTEGER,
+    title TEXT NOT NULL,
+    description TEXT,
+    button_label TEXT DEFAULT 'Create Ticket',
+    button_emoji TEXT,
+    button_style TEXT DEFAULT 'green',
+    allowed_roles TEXT,
+    embed_color TEXT DEFAULT '#3aa55c'
+)''')
+
+c.execute('''
+CREATE TABLE IF NOT EXISTS ticket_presets (
+    preset_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    fields TEXT,  -- JSON array of field objects
+    button_label TEXT DEFAULT 'Create Ticket',
+    button_emoji TEXT,
+    button_style TEXT DEFAULT 'green',
+    allowed_roles TEXT,
+    embed_color TEXT DEFAULT '#3aa55c',
+    UNIQUE(guild_id, name)
+)''')
+
 conn.commit()
 
 # Configuration
 SUPPORT_ROLE_ID = int(os.environ.get("SUPPORT_ROLE_ID", 0))
 LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", 0))
-CATEGORY_NAME = "Support Tickets"
+DEFAULT_CATEGORY_NAME = "Support Tickets"
 PRIORITIES = {"🟢 Low": "low", "🟡 Medium": "medium", "🔴 High": "high", "🚨 Critical": "critical"}
 
-# Ticket types with descriptions
-TICKET_TYPES = {
-    "general": "General support requests",
-    "technical": "Technical issues",
-    "billing": "Payment and billing questions",
-    "report": "Report a user or issue",
-    "application": "Staff or team applications"
-}
+# Utility functions
+def get_next_ticket_number(guild_id: int) -> int:
+    c.execute("SELECT COUNT(*) FROM tickets WHERE guild_id=?", (guild_id,))
+    return c.fetchone()[0] + 1
 
-class CustomTicketModal(ui.Modal, title="Create Custom Ticket"):
-    def __init__(self, panel_id=None):
-        super().__init__()
+async def log_action(guild_id: int, message: str):
+    channel = bot.get_channel(LOG_CHANNEL_ID)
+    if channel:
+        embed = discord.Embed(
+            description=message,
+            color=discord.Color.gold(),
+            timestamp=datetime.datetime.now()
+        )
+        await channel.send(embed=embed)
+
+async def create_transcript(channel: discord.TextChannel) -> str:
+    transcript = []
+    async for message in channel.history(limit=None, oldest_first=True):
+        content = message.content
+        if message.embeds:
+            content += "\n[Embed Content]"
+        if message.attachments:
+            content += "\n" + "\n".join([a.url for a in message.attachments])
+        transcript.append(f"{message.created_at} - {message.author.display_name}: {content}")
+    
+    filename = f"{channel.id}.txt"
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write("\n".join(transcript))
+    return filename
+
+async def get_ticket_category(guild: discord.Guild) -> discord.CategoryChannel:
+    c.execute("SELECT category_id FROM guild_config WHERE guild_id=?", (guild.id,))
+    result = c.fetchone()
+    
+    if result and result[0]:
+        category = guild.get_channel(result[0])
+        if category:
+            return category
+    
+    # Fallback to default category name
+    category = discord.utils.get(guild.categories, name=DEFAULT_CATEGORY_NAME)
+    if not category:
+        category = await guild.create_category(DEFAULT_CATEGORY_NAME)
+        c.execute("INSERT OR REPLACE INTO guild_config (guild_id, category_id) VALUES (?, ?)",
+                  (guild.id, category.id))
+        conn.commit()
+    return category
+
+async def has_ticket_permission(interaction: discord.Interaction) -> bool:
+    if interaction.user.guild_permissions.administrator:
+        return True
+    
+    c.execute("SELECT ticket_role_id FROM guild_config WHERE guild_id=?", (interaction.guild.id,))
+    result = c.fetchone()
+    
+    if not result or not result[0]:
+        return False
+    
+    ticket_role = interaction.guild.get_role(result[0])
+    return ticket_role in interaction.user.roles if ticket_role else False
+
+async def get_allowed_roles(panel_id: Optional[int] = None, preset_id: Optional[int] = None) -> List[int]:
+    if panel_id:
+        c.execute("SELECT allowed_roles FROM custom_panels WHERE panel_id=?", (panel_id,))
+    elif preset_id:
+        c.execute("SELECT allowed_roles FROM ticket_presets WHERE preset_id=?", (preset_id,))
+    else:
+        return []
+    
+    result = c.fetchone()
+    if not result or not result[0]:
+        return []
+    
+    try:
+        return json.loads(result[0])
+    except json.JSONDecodeError:
+        return []
+
+async def check_panel_permission(interaction: discord.Interaction, panel_id: Optional[int] = None, preset_id: Optional[int] = None) -> bool:
+    if interaction.user.guild_permissions.administrator:
+        return True
+    
+    allowed_roles = await get_allowed_roles(panel_id, preset_id)
+    if not allowed_roles:  # No specific roles set, fallback to global ticket role
+        return await has_ticket_permission(interaction)
+    
+    user_roles = [role.id for role in interaction.user.roles]
+    return any(role_id in user_roles for role_id in allowed_roles)
+
+# Modal for custom ticket creation
+class AdvancedTicketModal(ui.Modal, title="Create Custom Ticket"):
+    def __init__(self, panel_id: Optional[int] = None, preset_id: Optional[int] = None):
+        super().__init__(timeout=900)
         self.panel_id = panel_id
-        if panel_id:
+        self.preset_id = preset_id
+        
+        # Load preset if available
+        if preset_id:
+            c.execute("SELECT title, description, fields FROM ticket_presets WHERE preset_id=?", (preset_id,))
+            preset = c.fetchone()
+            if preset:
+                self.title = preset[0] or "Create Ticket"
+                self.description = preset[1]
+                try:
+                    fields = json.loads(preset[2]) if preset[2] else []
+                    for field in fields:
+                        self.add_item(ui.TextInput(
+                            label=field.get('name', 'Field'),
+                            placeholder=field.get('placeholder', ''),
+                            default=field.get('default', ''),
+                            style=discord.TextStyle.paragraph if field.get('long', False) else discord.TextStyle.short,
+                            required=field.get('required', True)
+                        )
+                except json.JSONDecodeError:
+                    pass
+        elif panel_id:
             c.execute("SELECT title FROM custom_panels WHERE panel_id=?", (panel_id,))
             result = c.fetchone()
-            if result:
+            if result and result[0]:
                 self.title = f"{result[0]} Ticket"
         
-    title_input = ui.TextInput(label="Ticket Title", style=discord.TextStyle.short, required=True)
-    description = ui.TextInput(label="Description", style=discord.TextStyle.paragraph, required=True)
-    additional_notes = ui.TextInput(label="Additional Notes", style=discord.TextStyle.paragraph, required=False)
-    attachments = ui.TextInput(label="Attachments (links separated by commas)", style=discord.TextStyle.paragraph, required=False)
+        # Add default fields if no preset
+        if not preset_id:
+            self.add_item(ui.TextInput(
+                label="Subject",
+                placeholder="Briefly describe your issue",
+                style=discord.TextStyle.short,
+                required=True
+            ))
+            self.add_item(ui.TextInput(
+                label="Description",
+                placeholder="Provide detailed information about your issue",
+                style=discord.TextStyle.paragraph,
+                required=True
+            ))
+            self.add_item(ui.TextInput(
+                label="Additional Information",
+                placeholder="Any other relevant details",
+                style=discord.TextStyle.paragraph,
+                required=False
+            ))
+            self.add_item(ui.TextInput(
+                label="Attachments (comma separated links)",
+                placeholder="https://example.com/image.png, https://example.com/file.pdf",
+                style=discord.TextStyle.short,
+                required=False
+            ))
     
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         
-        if not await has_ticket_permission(interaction):
+        if not await check_panel_permission(interaction, self.panel_id, self.preset_id):
             await interaction.followup.send("❌ You don't have permission to create tickets!", ephemeral=True)
             return
-            
+        
+        # Prepare custom data
         custom_data = {
-            "title": str(self.title_input),
-            "description": str(self.description),
-            "additional_notes": str(self.additional_notes) if self.additional_notes.value else None,
-            "attachments": [link.strip() for link in str(self.attachments).split(",")] if self.attachments.value else None,
-            "panel_id": self.panel_id
+            "title": self.title,
+            "fields": {},
+            "attachments": []
         }
         
-        await create_custom_ticket_channel(interaction, custom_data)
+        for child in self.children:
+            if isinstance(child, ui.TextInput):
+                if child.label.lower() == "attachments" and child.value:
+                    custom_data["attachments"] = [link.strip() for link in child.value.split(",") if link.strip()]
+                else:
+                    custom_data["fields"][child.label] = child.value
+        
+        # Create the ticket
+        await create_advanced_ticket(interaction, custom_data, self.panel_id, self.preset_id)
 
-async def create_custom_ticket_channel(interaction: discord.Interaction, custom_data: dict):
-    category = discord.utils.get(interaction.guild.categories, name=CATEGORY_NAME)
-    if not category:
-        category = await interaction.guild.create_category(CATEGORY_NAME)
+async def create_advanced_ticket(interaction: discord.Interaction, custom_data: dict, 
+                               panel_id: Optional[int] = None, preset_id: Optional[int] = None):
+    guild = interaction.guild
+    category = await get_ticket_category(guild)
+    ticket_number = get_next_ticket_number(guild.id)
     
-    ticket_number = get_next_ticket_number()
-    channel_name = f"ticket-{ticket_number}-{interaction.user.display_name}"
-    channel = await category.create_text_channel(channel_name[:99])
+    # Determine channel name
+    if preset_id:
+        c.execute("SELECT name FROM ticket_presets WHERE preset_id=?", (preset_id,))
+        preset_name = c.fetchone()[0]
+        channel_name = f"{preset_name}-{ticket_number}"
+    elif panel_id:
+        c.execute("SELECT title FROM custom_panels WHERE panel_id=?", (panel_id,))
+        panel_title = c.fetchone()[0]
+        channel_name = f"{panel_title.lower().replace(' ', '-')}-{ticket_number}"
+    else:
+        channel_name = f"ticket-{ticket_number}"
     
+    channel_name = channel_name[:99]  # Discord channel name limit
+    channel = await category.create_text_channel(channel_name)
+    
+    # Set permissions
     await channel.set_permissions(interaction.user, read_messages=True, send_messages=True)
-    await channel.set_permissions(interaction.guild.default_role, read_messages=False)
+    await channel.set_permissions(guild.default_role, read_messages=False)
     
-    support_role = interaction.guild.get_role(SUPPORT_ROLE_ID)
+    support_role = guild.get_role(SUPPORT_ROLE_ID)
     if support_role:
         await channel.set_permissions(support_role, read_messages=True, send_messages=True)
     
+    # Create embed
+    embed_color = discord.Color.green()
+    if panel_id:
+        c.execute("SELECT embed_color FROM custom_panels WHERE panel_id=?", (panel_id,))
+        color_hex = c.fetchone()[0]
+        if color_hex:
+            try:
+                embed_color = discord.Color.from_str(color_hex)
+            except:
+                pass
+    elif preset_id:
+        c.execute("SELECT embed_color FROM ticket_presets WHERE preset_id=?", (preset_id,))
+        color_hex = c.fetchone()[0]
+        if color_hex:
+            try:
+                embed_color = discord.Color.from_str(color_hex)
+            except:
+                pass
+    
     embed = discord.Embed(
-        title=f"Ticket #{ticket_number}: {custom_data['title']}",
-        color=discord.Color.blue()
+        title=f"Ticket #{ticket_number}: {custom_data.get('title', 'Support Ticket')}",
+        color=embed_color,
+        timestamp=datetime.datetime.now()
     )
+    
     embed.add_field(name="Created by", value=interaction.user.mention, inline=False)
-    embed.add_field(name="Title", value=custom_data['title'], inline=False)
-    embed.add_field(name="Description", value=custom_data['description'], inline=False)
     
-    if custom_data['additional_notes']:
-        embed.add_field(name="Additional Notes", value=custom_data['additional_notes'], inline=False)
+    for field_name, field_value in custom_data["fields"].items():
+        if field_value:  # Only add non-empty fields
+            embed.add_field(name=field_name, value=field_value[:1024], inline=False)
     
-    if custom_data['attachments']:
-        attachments_text = "\n".join([f"[Attachment {i+1}]({link})" for i, link in enumerate(custom_data['attachments']) if link])
-        embed.add_field(name="Attachments", value=attachments_text, inline=False)
+    if custom_data["attachments"]:
+        attachments_text = "\n".join([f"[Attachment {i+1}]({link})" for i, link in enumerate(custom_data["attachments"])])
+        embed.add_field(name="Attachments", value=attachments_text[:1024], inline=False)
     
-    embed.set_footer(text=f"Created at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    # Create view with management buttons
+    view = TicketManagementView()
     
-    message = await channel.send(
-        content=f"{interaction.user.mention} {support_role.mention if support_role else ''}",
-        embed=embed,
-        view=TicketManagementView()
-    )
-    await message.pin()
-    
-    c.execute("INSERT INTO tickets (user_id, channel_id, status, created_at, ticket_type, priority, custom_data) VALUES (?, ?, ?, ?, ?, ?, ?)",
-              (interaction.user.id, channel.id, "open", datetime.datetime.now(), "custom", "medium", json.dumps(custom_data)))
-    conn.commit()
-    
-    await interaction.followup.send(f"🎫 Ticket created: {channel.mention}", ephemeral=True)
-    await log_action(f"Custom ticket #{ticket_number} created by {interaction.user}")
-
-class CustomPanelModal(ui.Modal, title="Create Custom Ticket Panel"):
-    def __init__(self, channel):
-        super().__init__()
-        self.channel = channel
-        
-    title_input = ui.TextInput(label="Panel Title", style=discord.TextStyle.short, required=True)
-    description_input = ui.TextInput(label="Panel Description", style=discord.TextStyle.paragraph, required=False)
-    button_label = ui.TextInput(label="Button Label", style=discord.TextStyle.short, default="Create Ticket", required=True)
-    button_emoji = ui.TextInput(label="Button Emoji (optional)", style=discord.TextStyle.short, required=False)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        
-        c.execute("INSERT INTO custom_panels (guild_id, channel_id, title, description, button_label, button_emoji, button_style) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                  (interaction.guild.id, self.channel.id, str(self.title_input), 
-                   str(self.description_input) if self.description_input.value else None,
-                   str(self.button_label),
-                   str(self.button_emoji) if self.button_emoji.value else None,
-                   "green"))
-        conn.commit()
-        panel_id = c.lastrowid
-        
-        embed = discord.Embed(
-            title=str(self.title_input),
-            description=str(self.description_input) if self.description_input.value else None,
-            color=discord.Color.green()
-        )
-        
-        view = ui.View(timeout=None)
-        button = ui.Button(
-            label=str(self.button_label),
-            emoji=str(self.button_emoji) if self.button_emoji.value else None,
-            style=discord.ButtonStyle.green,
-            custom_id=f"custom_panel_{panel_id}"
-        )
-        button.callback = lambda i: on_custom_panel_button(i, panel_id)
-        view.add_item(button)
-        
-        panel_message = await self.channel.send(embed=embed, view=view)
-        c.execute("UPDATE custom_panels SET message_id = ? WHERE panel_id = ?", (panel_message.id, panel_id))
-        conn.commit()
-        
-        await interaction.followup.send("✅ Custom ticket panel created!", ephemeral=True)
-
-async def on_custom_panel_button(interaction: discord.Interaction, panel_id: int):
-    await interaction.response.send_modal(CustomTicketModal(panel_id))
-
-class TicketModal(ui.Modal, title="Create Support Ticket"):
-    def __init__(self, ticket_type):
-        super().__init__()
-        self.ticket_type = ticket_type
-        self.title = f"{ticket_type.capitalize()} Ticket"
-        
-    issue = ui.TextInput(label="Briefly describe your issue", style=discord.TextStyle.short)
-    details = ui.TextInput(label="Additional details", style=discord.TextStyle.paragraph)
-    attachments = ui.TextInput(label="Attachments (links separated by commas)", style=discord.TextStyle.paragraph, required=False)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        
-        if not await has_ticket_permission(interaction):
-            await interaction.followup.send("❌ You don't have permission to create tickets!", ephemeral=True)
-            return
-            
-        await create_ticket_channel(interaction, self.ticket_type, str(self.issue), str(self.details), str(self.attachments) if self.attachments.value else None)
-
-async def create_ticket_channel(interaction: discord.Interaction, ticket_type: str, issue: str, details: str, attachments: str = None):
-    category = discord.utils.get(interaction.guild.categories, name=CATEGORY_NAME)
-    if not category:
-        category = await interaction.guild.create_category(CATEGORY_NAME)
-    
-    ticket_number = get_next_ticket_number()
-    channel_name = f"{ticket_type}-{ticket_number}-{interaction.user.display_name}"
-    channel = await category.create_text_channel(channel_name[:99])
-    
-    await channel.set_permissions(interaction.user, read_messages=True, send_messages=True)
-    await channel.set_permissions(interaction.guild.default_role, read_messages=False)
-    
-    support_role = interaction.guild.get_role(SUPPORT_ROLE_ID)
+    # Ping support role if available
+    ping_content = interaction.user.mention
     if support_role:
-        await channel.set_permissions(support_role, read_messages=True, send_messages=True)
+        ping_content += f" {support_role.mention}"
     
-    embed = discord.Embed(
-        title=f"Support Ticket #{ticket_number}",
-        color=discord.Color.blue()
-    )
-    embed.add_field(name="User", value=interaction.user.mention, inline=False)
-    embed.add_field(name="Type", value=ticket_type.replace("-", " ").title(), inline=True)
-    embed.add_field(name="Status", value="🟢 Open", inline=True)
-    embed.add_field(name="Priority", value="🟡 Medium", inline=True)
-    embed.add_field(name="Issue", value=issue, inline=False)
-    embed.add_field(name="Details", value=details, inline=False)
-    
-    if attachments:
-        links = "\n".join([f"[Attachment {i+1}]({link.strip()})" for i, link in enumerate(attachments.split(",")) if link.strip()])
-        embed.add_field(name="Attachments", value=links, inline=False)
-    
-    embed.set_footer(text=f"Created at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    
+    # Send the ticket message
     message = await channel.send(
-        content=f"{interaction.user.mention} {support_role.mention if support_role else ''}",
+        content=ping_content,
         embed=embed,
-        view=TicketManagementView()
+        view=view
     )
     await message.pin()
     
-    c.execute("INSERT INTO tickets (user_id, channel_id, status, created_at, ticket_type, priority) VALUES (?, ?, ?, ?, ?, ?)",
-              (interaction.user.id, channel.id, "open", datetime.datetime.now(), ticket_type, "medium"))
+    # Store in database
+    c.execute('''
+    INSERT INTO tickets 
+    (user_id, channel_id, status, created_at, ticket_type, priority, custom_data, guild_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        interaction.user.id,
+        channel.id,
+        "open",
+        datetime.datetime.now().isoformat(),
+        "preset" if preset_id else "custom",
+        "medium",
+        json.dumps(custom_data),
+        guild.id
+    ))
     conn.commit()
     
     await interaction.followup.send(f"🎫 Ticket created: {channel.mention}", ephemeral=True)
-    await log_action(f"Ticket #{ticket_number} ({ticket_type}) created by {interaction.user}")
+    await log_action(guild.id, f"Ticket #{ticket_number} created by {interaction.user}")
 
-class TicketTypeView(ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        
-        for ticket_type, description in TICKET_TYPES.items():
-            self.add_item(TicketTypeButton(ticket_type, description))
-
-class TicketTypeButton(ui.Button):
-    def __init__(self, ticket_type, description):
-        super().__init__(
-            label=ticket_type.replace("-", " ").title(),
-            style=discord.ButtonStyle.blurple,
-            custom_id=f"ticket_{ticket_type}",
-            emoji="📩"
-        )
-        self.ticket_type = ticket_type
-        self.description = description
-        
-    async def callback(self, interaction: discord.Interaction):
-        if not await has_ticket_permission(interaction):
-            await interaction.response.send_message("❌ You don't have permission to create tickets!", ephemeral=True)
-            return
-            
-        await interaction.response.send_modal(TicketModal(self.ticket_type))
-
+# Ticket management view
 class TicketManagementView(ui.View):
     def __init__(self):
         super().__init__(timeout=None)
     
-    @ui.button(label="Claim Ticket", style=discord.ButtonStyle.green, custom_id="claim_ticket", emoji="🙋")
+    @ui.button(label="Claim Ticket", style=discord.ButtonStyle.green, custom_id="ticket_claim", emoji="🙋")
     async def claim_ticket(self, interaction: discord.Interaction, button: ui.Button):
         c.execute("UPDATE tickets SET assigned_to = ?, status = ? WHERE channel_id = ?",
                   (interaction.user.id, "claimed", interaction.channel.id))
         conn.commit()
         
         embed = interaction.message.embeds[0]
-        embed.set_field_at(2, name="Status", value="🟡 Claimed", inline=True)
-        if len(embed.fields) > 3:
-            embed.set_field_at(3, name="Assigned To", value=interaction.user.mention, inline=True)
+        for i, field in enumerate(embed.fields):
+            if field.name == "Status":
+                embed.set_field_at(i, name="Status", value="🟡 Claimed", inline=True)
+                break
         else:
-            embed.add_field(name="Assigned To", value=interaction.user.mention, inline=True)
+            embed.add_field(name="Status", value="🟡 Claimed", inline=True)
+        
+        embed.add_field(name="Assigned To", value=interaction.user.mention, inline=True)
         await interaction.message.edit(embed=embed)
         
         await interaction.response.send_message(
             f"✅ {interaction.user.mention} has claimed this ticket",
             allowed_mentions=discord.AllowedMentions.none()
         )
-        await log_action(f"Ticket claimed by {interaction.user} in #{interaction.channel.name}")
+        await log_action(interaction.guild.id, f"Ticket claimed by {interaction.user} in #{interaction.channel.name}")
     
-    @ui.button(label="Add User", style=discord.ButtonStyle.blurple, custom_id="add_user", emoji="👥")
+    @ui.button(label="Add User", style=discord.ButtonStyle.blurple, custom_id="ticket_add_user", emoji="👥")
     async def add_user(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_modal(AddUserModal())
     
-    @ui.button(label="Set Priority", style=discord.ButtonStyle.gray, custom_id="set_priority", emoji="⚠️")
+    @ui.button(label="Set Priority", style=discord.ButtonStyle.gray, custom_id="ticket_set_priority", emoji="⚠️")
     async def set_priority(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.send_message(
-            "Select ticket priority:",
-            view=PriorityView(),
-            ephemeral=True
-        )
+        view = PriorityView()
+        await interaction.response.send_message("Select ticket priority:", view=view, ephemeral=True)
     
-    @ui.button(label="Close Ticket", style=discord.ButtonStyle.red, custom_id="close_ticket", emoji="🔒")
+    @ui.button(label="Close Ticket", style=discord.ButtonStyle.red, custom_id="ticket_close", emoji="🔒")
     async def close_ticket(self, interaction: discord.Interaction, button: ui.Button):
         c.execute("UPDATE tickets SET status = ? WHERE channel_id = ?",
                   ("closed", interaction.channel.id))
@@ -342,37 +422,40 @@ class TicketManagementView(ui.View):
         await interaction.response.send_message("🔒 Closing ticket in 10 seconds...")
         await asyncio.sleep(10)
         await interaction.channel.delete(reason="Ticket closed")
-        await log_action(f"Ticket closed by {interaction.user} in #{interaction.channel.name}")
+        await log_action(interaction.guild.id, f"Ticket closed by {interaction.user} in #{interaction.channel.name}")
 
 class AddUserModal(ui.Modal, title="Add User to Ticket"):
-    user = ui.TextInput(label="User ID, @Mention, or Name", style=discord.TextStyle.short)
+    user = ui.TextInput(label="User ID, @Mention, or Name", placeholder="Enter user identifier", required=True)
     
     async def on_submit(self, interaction: discord.Interaction):
-        try:
-            user_input = str(self.user).strip()
-            
-            if user_input.startswith("<@") and user_input.endswith(">"):
-                user_id = int(user_input[2:-1])
-                user = interaction.guild.get_member(user_id)
-            elif user_input.isdigit():
-                user = interaction.guild.get_member(int(user_input))
-            else:
-                user = discord.utils.find(
-                    lambda m: user_input.lower() in m.display_name.lower() or user_input.lower() in m.name.lower(),
-                    interaction.guild.members
-                )
-            
-            if not user:
-                await interaction.response.send_message("❌ User not found!", ephemeral=True)
-                return
-                
-            await interaction.channel.set_permissions(user, read_messages=True, send_messages=True)
-            await interaction.response.send_message(
-                f"✅ {user.mention} has been added to the ticket",
-                allowed_mentions=discord.AllowedMentions.none()
+        user_input = str(self.user).strip()
+        user = None
+        
+        # Try to parse as mention
+        if user_input.startswith("<@") and user_input.endswith(">"):
+            user_id = user_input[2:-1].replace("!", "")  # Remove ! if present (nickname mention)
+            if user_id.isdigit():
+                user = interaction.guild.get_member(int(user_id))
+        # Try to parse as ID
+        elif user_input.isdigit():
+            user = interaction.guild.get_member(int(user_input))
+        # Try to find by name
+        else:
+            user = discord.utils.find(
+                lambda m: user_input.lower() in m.display_name.lower() or 
+                         user_input.lower() in m.name.lower(),
+                interaction.guild.members
             )
-        except ValueError:
-            await interaction.response.send_message("❌ Invalid user format! Use ID, mention, or name", ephemeral=True)
+        
+        if not user:
+            await interaction.response.send_message("❌ User not found!", ephemeral=True)
+            return
+        
+        await interaction.channel.set_permissions(user, read_messages=True, send_messages=True)
+        await interaction.response.send_message(
+            f"✅ {user.mention} has been added to the ticket",
+            allowed_mentions=discord.AllowedMentions.none()
+        )
 
 class PriorityView(ui.View):
     def __init__(self):
@@ -395,69 +478,231 @@ class PriorityButton(ui.Button):
                   (self.priority, interaction.channel.id))
         conn.commit()
         
-        embed = interaction.message.embeds[0] if interaction.message.embeds else None
-        if not embed:
-            await interaction.response.send_message("❌ Couldn't find ticket info!", ephemeral=True)
-            return
-            
+        embed = interaction.message.embeds[0]
         for i, field in enumerate(embed.fields):
             if field.name == "Priority":
                 embed.set_field_at(i, name="Priority", value=self.label, inline=True)
                 break
         
         await interaction.message.edit(embed=embed)
-        await interaction.response.send_message(
-            f"✅ Priority set to {self.label}",
-            ephemeral=True
-        )
+        await interaction.response.send_message(f"✅ Priority set to {self.label}", ephemeral=True)
 
-async def create_transcript(channel):
-    transcript = []
-    async for message in channel.history(limit=None, oldest_first=True):
-        content = message.content
-        if message.embeds:
-            content += "\n[Embed Content]"
-        if message.attachments:
-            content += "\n" + "\n".join([a.url for a in message.attachments])
-        transcript.append(f"{message.created_at} - {message.author.display_name}: {content}")
+# Command to create a ticket panel
+@bot.tree.command(name="createpanel", description="Create a custom ticket panel")
+@app_commands.default_permissions(administrator=True)
+async def create_panel(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    title: str,
+    description: Optional[str] = None,
+    button_label: Optional[str] = "Create Ticket",
+    button_emoji: Optional[str] = None,
+    button_color: Optional[Literal["green", "blue", "red", "gray"]] = "green",
+    embed_color: Optional[str] = "#3aa55c",
+    allowed_roles: Optional[str] = None
+):
+    """Create a custom ticket panel with advanced options"""
+    await interaction.response.defer(ephemeral=True)
     
-    filename = f"{channel.id}.txt"
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write("\n".join(transcript))
+    # Parse allowed roles
+    role_ids = []
+    if allowed_roles:
+        for role_mention in allowed_roles.split():
+            try:
+                role_id = int(role_mention.strip("<@&>"))
+                if interaction.guild.get_role(role_id):
+                    role_ids.append(role_id)
+            except ValueError:
+                pass
     
-    return filename
-
-async def log_action(message):
-    channel = bot.get_channel(LOG_CHANNEL_ID)
-    if channel:
-        embed = discord.Embed(
-            description=message,
-            color=discord.Color.gold(),
-            timestamp=datetime.datetime.now()
-        )
-        await channel.send(embed=embed)
-
-def get_next_ticket_number():
-    c.execute("SELECT COUNT(*) FROM tickets")
-    count = c.fetchone()[0]
-    return count + 1
-
-async def has_ticket_permission(interaction: discord.Interaction) -> bool:
-    if interaction.user.guild_permissions.administrator:
-        return True
+    # Insert panel into database
+    c.execute('''
+    INSERT INTO custom_panels 
+    (guild_id, channel_id, title, description, button_label, button_emoji, button_style, embed_color, allowed_roles)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        interaction.guild.id,
+        channel.id,
+        title,
+        description,
+        button_label,
+        button_emoji,
+        button_color,
+        embed_color,
+        json.dumps(role_ids) if role_ids else None
+    ))
+    panel_id = c.lastrowid
     
-    c.execute("SELECT ticket_role_id FROM guild_config WHERE guild_id=?", (interaction.guild.id,))
+    # Create the embed
+    try:
+        color = discord.Color.from_str(embed_color)
+    except:
+        color = discord.Color.green()
+    
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=color
+    )
+    
+    # Create the view with button
+    view = ui.View(timeout=None)
+    button = ui.Button(
+        label=button_label,
+        emoji=button_emoji,
+        style=getattr(discord.ButtonStyle, button_color),
+        custom_id=f"panel_{panel_id}"
+    )
+    button.callback = lambda i: panel_button_callback(i, panel_id)
+    view.add_item(button)
+    
+    # Send the panel
+    message = await channel.send(embed=embed, view=view)
+    
+    # Update message ID in database
+    c.execute("UPDATE custom_panels SET message_id = ? WHERE panel_id = ?", (message.id, panel_id))
+    conn.commit()
+    
+    await interaction.followup.send(f"✅ Panel created in {channel.mention}!", ephemeral=True)
+
+async def panel_button_callback(interaction: discord.Interaction, panel_id: int):
+    await interaction.response.send_modal(AdvancedTicketModal(panel_id=panel_id))
+
+# Command to create a ticket preset
+@bot.tree.command(name="createticketpreset", description="Create a reusable ticket preset")
+@app_commands.default_permissions(administrator=True)
+async def create_ticket_preset(
+    interaction: discord.Interaction,
+    name: str,
+    title: str,
+    description: Optional[str] = None,
+    button_label: Optional[str] = "Create Ticket",
+    button_emoji: Optional[str] = None,
+    button_color: Optional[Literal["green", "blue", "red", "gray"]] = "green",
+    embed_color: Optional[str] = "#3aa55c",
+    allowed_roles: Optional[str] = None,
+    fields: Optional[str] = None
+):
+    """Create a reusable ticket preset with custom fields"""
+    await interaction.response.defer(ephemeral=True)
+    
+    # Parse allowed roles
+    role_ids = []
+    if allowed_roles:
+        for role_mention in allowed_roles.split():
+            try:
+                role_id = int(role_mention.strip("<@&>"))
+                if interaction.guild.get_role(role_id):
+                    role_ids.append(role_id)
+            except ValueError:
+                pass
+    
+    # Parse fields if provided
+    fields_data = []
+    if fields:
+        try:
+            fields_data = json.loads(fields)
+            if not isinstance(fields_data, list):
+                fields_data = []
+        except json.JSONDecodeError:
+            fields_data = []
+    
+    # Insert preset into database
+    c.execute('''
+    INSERT INTO ticket_presets 
+    (guild_id, name, title, description, button_label, button_emoji, button_style, 
+     embed_color, allowed_roles, fields)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(guild_id, name) DO UPDATE SET
+        title = excluded.title,
+        description = excluded.description,
+        button_label = excluded.button_label,
+        button_emoji = excluded.button_emoji,
+        button_style = excluded.button_style,
+        embed_color = excluded.embed_color,
+        allowed_roles = excluded.allowed_roles,
+        fields = excluded.fields
+    ''', (
+        interaction.guild.id,
+        name.lower(),
+        title,
+        description,
+        button_label,
+        button_emoji,
+        button_color,
+        embed_color,
+        json.dumps(role_ids) if role_ids else None,
+        json.dumps(fields_data) if fields_data else None
+    ))
+    conn.commit()
+    
+    await interaction.followup.send(f"✅ Ticket preset '{name}' created/updated!", ephemeral=True)
+
+# Command to create a ticket from a preset
+@bot.tree.command(name="ticket", description="Create a ticket from a preset")
+async def create_ticket_from_preset(interaction: discord.Interaction, preset: str):
+    """Create a ticket using a predefined preset"""
+    await interaction.response.defer(ephemeral=True)
+    
+    c.execute("SELECT preset_id FROM ticket_presets WHERE guild_id = ? AND name = ?", 
+              (interaction.guild.id, preset.lower()))
     result = c.fetchone()
     
-    if not result or not result[0]:
-        return False
+    if not result:
+        await interaction.followup.send("❌ Ticket preset not found!", ephemeral=True)
+        return
     
-    ticket_role = interaction.guild.get_role(result[0])
-    return ticket_role in interaction.user.roles if ticket_role else False
+    preset_id = result[0]
+    if not await check_panel_permission(interaction, preset_id=preset_id):
+        await interaction.followup.send("❌ You don't have permission to create this type of ticket!", ephemeral=True)
+        return
+    
+    await interaction.followup.send_modal(AdvancedTicketModal(preset_id=preset_id))
 
-@bot.tree.command(name="set-ticket-role", description="Set which role can create tickets (Admin only)")
-@commands.has_permissions(administrator=True)
+# Command to list available presets
+@bot.tree.command(name="listpresets", description="List available ticket presets")
+async def list_presets(interaction: discord.Interaction):
+    """List all available ticket presets"""
+    c.execute("SELECT name, description FROM ticket_presets WHERE guild_id = ?", (interaction.guild.id,))
+    presets = c.fetchall()
+    
+    if not presets:
+        await interaction.response.send_message("❌ No ticket presets available!", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title="Available Ticket Presets",
+        color=discord.Color.blue()
+    )
+    
+    for name, description in presets:
+        embed.add_field(
+            name=name.capitalize(),
+            value=description or "No description",
+            inline=False
+        )
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# Command to set ticket category
+@bot.tree.command(name="setticketcategory", description="Set the category for new tickets")
+@app_commands.default_permissions(administrator=True)
+async def set_ticket_category(interaction: discord.Interaction, category: discord.CategoryChannel):
+    """Set the category where new tickets will be created"""
+    c.execute("INSERT OR REPLACE INTO guild_config (guild_id, category_id) VALUES (?, ?)",
+              (interaction.guild.id, category.id))
+    conn.commit()
+    
+    await interaction.response.send_message(
+        f"✅ Ticket category set to {category.name}",
+        ephemeral=True
+    )
+
+# Command to set ticket role
+@bot.tree.command(name="setticketrole", description="Set which role can create tickets")
+@app_commands.default_permissions(administrator=True)
 async def set_ticket_role(interaction: discord.Interaction, role: discord.Role):
+    """Set the role that can create tickets"""
     c.execute("INSERT OR REPLACE INTO guild_config (guild_id, ticket_role_id) VALUES (?, ?)",
               (interaction.guild.id, role.id))
     conn.commit()
@@ -466,51 +711,30 @@ async def set_ticket_role(interaction: discord.Interaction, role: discord.Role):
         f"✅ Ticket creation role set to {role.mention}",
         ephemeral=True
     )
-    await log_action(f"Ticket role set to {role.name} by {interaction.user}")
 
-@bot.tree.command(name="ticketpanel", description="Setup ticket creation panel (Admin only)")
-@commands.has_permissions(administrator=True)
-async def ticket_panel(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="Support Ticket System",
-        description="Select ticket type below:",
-        color=discord.Color.green()
-    )
-    for ticket_type, description in TICKET_TYPES.items():
-        embed.add_field(
-            name=ticket_type.replace("-", " ").title(),
-            value=description,
-            inline=False
-        )
-    
-    c.execute("SELECT ticket_role_id FROM guild_config WHERE guild_id=?", (interaction.guild.id,))
-    result = c.fetchone()
-    role_mention = f"<@&{result[0]}>" if result and result[0] else "Not set"
-    
-    embed.add_field(
-        name="Permission",
-        value=f"Only {role_mention} can create tickets",
-        inline=False
-    )
-    embed.set_footer(text="Our team will respond as soon as possible")
+# Command to set ping role
+@bot.tree.command(name="setpingrole", description="Set which role gets pinged in new tickets")
+@app_commands.default_permissions(administrator=True)
+async def set_ping_role(interaction: discord.Interaction, role: discord.Role):
+    """Set the role that will be pinged when new tickets are created"""
+    c.execute("INSERT OR REPLACE INTO guild_config (guild_id, ping_role_id) VALUES (?, ?)",
+              (interaction.guild.id, role.id))
+    conn.commit()
     
     await interaction.response.send_message(
-        embed=embed,
-        view=TicketTypeView()
+        f"✅ Ticket ping role set to {role.mention}",
+        ephemeral=True
     )
 
-@bot.tree.command(name="createpanel", description="Create custom ticket panel (Admin only)")
-@commands.has_permissions(administrator=True)
-async def create_panel(interaction: discord.Interaction, channel: discord.TextChannel):
-    await interaction.response.send_modal(CustomPanelModal(channel))
-
+# Command to get ticket stats
 @bot.tree.command(name="ticketstats", description="Show ticket statistics")
-@commands.has_permissions(manage_guild=True)
+@app_commands.default_permissions(manage_guild=True)
 async def ticket_stats(interaction: discord.Interaction):
-    c.execute("SELECT status, COUNT(*) FROM tickets GROUP BY status")
+    """Show statistics about tickets"""
+    c.execute("SELECT status, COUNT(*) FROM tickets WHERE guild_id = ? GROUP BY status", (interaction.guild.id,))
     status_counts = dict(c.fetchall())
     
-    c.execute("SELECT ticket_type, COUNT(*) FROM tickets GROUP BY ticket_type")
+    c.execute("SELECT ticket_type, COUNT(*) FROM tickets WHERE guild_id = ? GROUP BY ticket_type", (interaction.guild.id,))
     type_counts = dict(c.fetchall())
     
     embed = discord.Embed(
@@ -518,28 +742,28 @@ async def ticket_stats(interaction: discord.Interaction):
         color=discord.Color.blue()
     )
     
-    status_text = "\n".join([f"• **{status.capitalize()}**: {count}" 
-                            for status, count in status_counts.items()])
+    status_text = "\n".join([f"• **{status.capitalize()}**: {count}" for status, count in status_counts.items()])
     embed.add_field(name="Status Summary", value=status_text, inline=False)
     
-    type_text = "\n".join([f"• **{ttype.replace('-', ' ').title()}**: {count}" 
-                          for ttype, count in type_counts.items()])
+    type_text = "\n".join([f"• **{ttype.replace('-', ' ').title()}**: {count}" for ttype, count in type_counts.items()])
     embed.add_field(name="Ticket Types", value=type_text, inline=False)
     
-    c.execute("SELECT COUNT(*) FROM tickets WHERE status = 'open'")
+    c.execute("SELECT COUNT(*) FROM tickets WHERE guild_id = ? AND status = 'open'", (interaction.guild.id,))
     open_count = c.fetchone()[0]
     embed.add_field(name="Open Tickets", value=str(open_count), inline=True)
     
-    c.execute("SELECT COUNT(*) FROM tickets WHERE status = 'claimed'")
+    c.execute("SELECT COUNT(*) FROM tickets WHERE guild_id = ? AND status = 'claimed'", (interaction.guild.id,))
     claimed_count = c.fetchone()[0]
     embed.add_field(name="Claimed Tickets", value=str(claimed_count), inline=True)
     
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="forceclose", description="Force close a ticket (Admin only)")
-@commands.has_permissions(administrator=True)
+# Command to force close a ticket
+@bot.tree.command(name="forceclose", description="Force close a ticket")
+@app_commands.default_permissions(administrator=True)
 async def force_close(interaction: discord.Interaction, reason: str = "Admin closure"):
-    if "ticket" not in interaction.channel.name:
+    """Force close a ticket channel"""
+    if "ticket" not in interaction.channel.name.lower():
         await interaction.response.send_message("❌ This is not a ticket channel!", ephemeral=True)
         return
         
@@ -558,34 +782,35 @@ async def force_close(interaction: discord.Interaction, reason: str = "Admin clo
     await interaction.response.send_message("🔒 Closing ticket immediately...")
     await interaction.channel.delete(reason=f"Force closed by admin: {reason}")
 
+# Event handlers
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user.name}")
+    print(f"Logged in as {bot.user.name} (ID: {bot.user.id})")
+    print("------")
+    
     await bot.change_presence(activity=discord.Activity(
-        type=discord.ActivityType.watching, 
-        name="Support Tickets"
+        type=discord.ActivityType.watching,
+        name="for tickets"
     ))
+    
+    # Register persistent views
     bot.add_view(TicketManagementView())
-    bot.add_view(TicketTypeView())
     bot.add_view(PriorityView())
     
     # Load custom panels
-    c.execute("SELECT * FROM custom_panels")
+    c.execute("SELECT panel_id FROM custom_panels")
     panels = c.fetchall()
-    for panel in panels:
-        panel_id = panel[0]
+    for (panel_id,) in panels:
         view = ui.View(timeout=None)
         button = ui.Button(
-            label=panel[5],
-            emoji=panel[6],
-            style=discord.ButtonStyle.green,
-            custom_id=f"custom_panel_{panel_id}"
+            custom_id=f"panel_{panel_id}",
+            style=discord.ButtonStyle.green
         )
-        button.callback = lambda i, pid=panel_id: on_custom_panel_button(i, pid)
+        button.callback = lambda i, pid=panel_id: panel_button_callback(i, pid)
         view.add_item(button)
         bot.add_view(view)
     
     await bot.tree.sync()
 
 if __name__ == "__main__":
-    bot.run(os.environ["BOT_TOKEN"])
+    bot.run(BOT_TOKEN)
