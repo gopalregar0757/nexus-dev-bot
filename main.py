@@ -177,19 +177,6 @@ async def editticket(interaction: discord.Interaction):
         return
     await interaction.response.send_modal(EditTicketModal(interaction.channel))
 
-# Command to list all presets
-@bot.tree.command(name="listpresets", description="List all ticket presets")
-async def list_presets(interaction: discord.Interaction):
-    c.execute("SELECT name, description FROM ticket_presets WHERE guild_id = ?", (interaction.guild.id,))
-    presets = c.fetchall()
-    if not presets:
-        await interaction.response.send_message("❌ No presets found.", ephemeral=True)
-        return
-    embed = discord.Embed(title="Available Ticket Presets", color=0x8B0000)
-    for name, desc in presets:
-        embed.add_field(name=name.capitalize(), value=desc or "No description", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
 # Sync persistent view
 @bot.event
 async def on_ready():
