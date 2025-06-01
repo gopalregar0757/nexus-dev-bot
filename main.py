@@ -11,10 +11,14 @@ import sys
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+
 try:
     APPLICATION_ID = int(os.environ["APPLICATION_ID"])
-except (KeyError, ValueError) as e:
-    print(f"ERROR: Invalid APPLICATION_ID - {e}")
+    BOT_TOKEN = os.environ["BOT_TOKEN"]
+    SUPPORT_ROLE_ID = int(os.environ.get("SUPPORT_ROLE_ID", 0))
+    LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", 0))
+except (ValueError, KeyError) as e:
+    print(f"ERROR: Environment variable issue - {e}")
     sys.exit(1)
 
 bot = commands.Bot(command_prefix="!", intents=intents, application_id=APPLICATION_ID)
