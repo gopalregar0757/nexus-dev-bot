@@ -14,7 +14,7 @@ intents.message_content = True
 intents.members = True
 
 try:
-    APPLICATION_ID = int(os.environ[1378651520911802428])
+    APPLICATION_ID = int(os.environ["APPLICATION_ID"])
     BOT_TOKEN = os.environ["BOT_TOKEN"]
     SUPPORT_ROLE_ID = int(os.environ.get("SUPPORT_ROLE_ID", 0))
     LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", 0))
