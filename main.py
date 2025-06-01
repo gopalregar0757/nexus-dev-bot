@@ -4,6 +4,8 @@ from discord.ext import commands
 import sqlite3
 import datetime
 import asyncio
+import os
+
 
 # Initialize bot
 intents = discord.Intents.default()
@@ -12,11 +14,10 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, application_id="YOUR_APP_ID")
 
-# Database setup
-import os
-DB_PATH = os.environ.get("DB_PATH", "tickets.db")  # Use Railway volume path
+DB_PATH = os.environ.get("DB_PATH", "tickets.db")
 conn = sqlite3.connect(DB_PATH)
-conn.execute('''CREATE TABLE IF NOT EXISTS tickets
+c = conn.cursor()
+c.execute('''CREATE TABLE IF NOT EXISTS tickets
              (id INTEGER PRIMARY KEY, 
               user_id INTEGER, 
               channel_id INTEGER,
@@ -214,5 +215,6 @@ async def close_ticket(interaction: discord.Interaction):
     view = TicketCloseView()
     await view.close_ticket(interaction, None)
 
+
 if __name__ == "__main__":
-    bot.run("YOUR_BOT_TOKEN")
+    bot.run(os.environ["BOT_TOKEN"]) 
