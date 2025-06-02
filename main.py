@@ -505,7 +505,7 @@ class AddUserModal(ui.Modal, title="Add User to Ticket"):
 
 class PriorityView(ui.View):
     def __init__(self):
-        super().__init__(timeout=30)
+        super().__init__(timeout=None)  # Set timeout to None to make it persistent
         for label, priority in PRIORITIES.items():
             self.add_item(PriorityButton(label, priority))
 
@@ -514,7 +514,7 @@ class PriorityButton(ui.Button):
         super().__init__(
             label=label,
             style=discord.ButtonStyle.gray,
-            custom_id=f"priority_{priority}"
+            custom_id=f"priority_{priority}"  # custom_id is required for persistence
         )
         self.priority = priority
         self.label_text = label
@@ -922,25 +922,25 @@ async def force_close(interaction: discord.Interaction, reason: str = "Admin clo
 async def on_ready():
     print(f"Logged in as {bot.user.name} (ID: {bot.user.id})")
     print("------")
-    
+
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.watching,
         name="for tickets"
     ))
-    
+
     # Register persistent views
-    bot.add_view(TicketManagementView())
-    bot.add_view(PriorityView())
-    
-    # Load custom panels
+    bot.add_view(TicketManagementView())  # already timeout=None
+    bot.add_view(PriorityView())          # now persistent
+
+    # Register views for saved panels
     c.execute("SELECT panel_id FROM custom_panels")
     panels = c.fetchall()
     for (panel_id,) in panels:
         view = ui.View(timeout=None)
-        
+
         async def panel_callback(i: discord.Interaction, pid: int = panel_id):
             await i.response.send_modal(AdvancedTicketModal(panel_id=pid))
-        
+
         button = ui.Button(
             custom_id=f"panel_{panel_id}",
             style=discord.ButtonStyle.green
@@ -948,12 +948,13 @@ async def on_ready():
         button.callback = lambda i, pid=panel_id: panel_callback(i, pid)
         view.add_item(button)
         bot.add_view(view)
-    
+
     try:
         await bot.tree.sync()
         print("Commands synced successfully")
     except Exception as e:
         print(f"Error syncing commands: {e}")
+
 
 if __name__ == "__main__":
     bot.run(BOT_TOKEN)
