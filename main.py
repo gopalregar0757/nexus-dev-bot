@@ -397,6 +397,30 @@ async def create_advanced_ticket(interaction: discord.Interaction, custom_data: 
     await interaction.followup.send(f"🎫 Ticket created: {channel.mention}", ephemeral=True)
     await log_action(guild.id, f"Ticket #{ticket_number} created by {interaction.user}")
 
+class PriorityView(ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        for label, value in PRIORITIES.items():
+            self.add_item(PriorityButton(label=label, priority=value))
+
+
+class PriorityButton(ui.Button):
+    def __init__(self, label: str, priority: str):
+        super().__init__(label=label, style=discord.ButtonStyle.secondary, custom_id=f"priority_{priority}")
+        self.priority = priority
+
+    async def callback(self, interaction: discord.Interaction):
+        # Update priority in DB
+        c.execute("UPDATE tickets SET priority = ? WHERE channel_id = ?", (self.priority, interaction.channel.id))
+        conn.commit()
+
+        await interaction.response.send_message(
+            f"✅ Priority set to **{self.label}**.",
+            ephemeral=True
+        )
+        await log_action(interaction.guild.id, f"Priority of ticket in {interaction.channel.mention} set to {self.label} by {interaction.user.mention}")
+
+
 # Ticket management view (without claim button)
 class TicketManagementView(ui.View):
     def __init__(self):
