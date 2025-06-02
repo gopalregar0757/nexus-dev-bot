@@ -338,7 +338,19 @@ async def create_advanced_ticket(interaction: discord.Interaction, custom_data: 
         if field_value:  # Only add non-empty fields
             embed.add_field(name=field_name, value=field_value[:1024], inline=False)
     
-    # Create view with management buttons
+    # Mark ticket as claimed automatically
+    assigned_to = SUPPORT_ROLE_ID if SUPPORT_ROLE_ID else interaction.user.id
+    c.execute("UPDATE tickets SET status = 'claimed', assigned_to = ? WHERE channel_id = ?",
+              (assigned_to, channel.id))
+    conn.commit()
+    
+    embed.add_field(name="Status", value="🟡 Claimed", inline=False)
+    if SUPPORT_ROLE_ID:
+        support_role = guild.get_role(SUPPORT_ROLE_ID)
+        if support_role:
+            embed.add_field(name="Assigned To", value=support_role.mention, inline=False)
+    
+    # Create view with management buttons (without claim button)
     view = TicketManagementView()
     
     # Ping support role if available
@@ -373,7 +385,7 @@ async def create_advanced_ticket(interaction: discord.Interaction, custom_data: 
     ''', (
         interaction.user.id,
         channel.id,
-        "open",
+        "claimed",  # Automatically mark as claimed
         datetime.datetime.now().isoformat(),
         "preset" if preset_id else "custom",
         "medium",
@@ -385,36 +397,10 @@ async def create_advanced_ticket(interaction: discord.Interaction, custom_data: 
     await interaction.followup.send(f"🎫 Ticket created: {channel.mention}", ephemeral=True)
     await log_action(guild.id, f"Ticket #{ticket_number} created by {interaction.user}")
 
-# Ticket management view
+# Ticket management view (without claim button)
 class TicketManagementView(ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-    
-    @ui.button(label="Claim Ticket", style=discord.ButtonStyle.green, custom_id="ticket_claim", emoji="🙋")
-    async def claim_ticket(self, interaction: discord.Interaction, button: ui.Button):
-        c.execute("UPDATE tickets SET assigned_to = ?, status = ? WHERE channel_id = ?",
-                  (interaction.user.id, "claimed", interaction.channel.id))
-        conn.commit()
-        
-        embed = interaction.message.embeds[0]
-        found = False
-        for i, field in enumerate(embed.fields):
-            if field.name == "Status":
-                embed.set_field_at(i, name="Status", value="🟡 Claimed", inline=True)
-                found = True
-                break
-        
-        if not found:
-            embed.add_field(name="Status", value="🟡 Claimed", inline=True)
-        
-        embed.add_field(name="Assigned To", value=interaction.user.mention, inline=True)
-        await interaction.message.edit(embed=embed)
-        
-        await interaction.response.send_message(
-            f"✅ {interaction.user.mention} has claimed this ticket",
-            allowed_mentions=discord.AllowedMentions.none()
-        )
-        await log_action(interaction.guild.id, f"Ticket claimed by {interaction.user} in #{interaction.channel.name}")
     
     @ui.button(label="Add User", style=discord.ButtonStyle.blurple, custom_id="ticket_add_user", emoji="👥")
     async def add_user(self, interaction: discord.Interaction, button: ui.Button):
@@ -431,112 +417,109 @@ class TicketManagementView(ui.View):
                   ("closed", interaction.channel.id))
         conn.commit()
         
-        try:
-            transcript = await create_transcript(interaction.channel)
-        except Exception as e:
-            print(f"Error creating transcript: {e}")
-            transcript = None
+        # Remove the original ticket management view
+        pins = await interaction.channel.pins()
+        if pins:
+            ticket_message = pins[0]
+            await ticket_message.edit(view=None)
         
-        if LOG_CHANNEL_ID and transcript:
-            log_channel = bot.get_channel(LOG_CHANNEL_ID)
-            if log_channel:
-                try:
-                    await log_channel.send(
-                        f"📂 Ticket closed by {interaction.user.mention}",
-                        file=discord.File(transcript, filename=f"transcript-{interaction.channel.name}.txt")
-                    )
-                    os.remove(transcript)
-                except Exception as e:
-                    print(f"Error sending transcript: {e}")
+        # Get creator ID for transcript DM
+        c.execute("SELECT user_id FROM tickets WHERE channel_id = ?", (interaction.channel.id,))
+        creator_id = c.fetchone()[0]
         
-        await interaction.response.send_message("🔒 Closing ticket in 10 seconds...")
-        await asyncio.sleep(10)
-        try:
-            await interaction.channel.delete(reason="Ticket closed")
-        except discord.Forbidden:
-            await interaction.followup.send("❌ Bot doesn't have permission to delete this channel!")
+        # Send closed ticket panel
+        view = ClosedTicketView(interaction.channel, creator_id)
+        await interaction.response.send_message(
+            "🔒 Ticket closed. Please choose an action:",
+            view=view
+        )
         await log_action(interaction.guild.id, f"Ticket closed by {interaction.user} in #{interaction.channel.name}")
 
-class AddUserModal(ui.Modal, title="Add User to Ticket"):
-    user = ui.TextInput(label="User ID, @Mention, or Name", placeholder="Enter user identifier", required=True)
+# View for closed ticket actions
+class ClosedTicketView(ui.View):
+    def __init__(self, channel: discord.TextChannel, creator_id: int):
+        super().__init__(timeout=None)
+        self.channel = channel
+        self.creator_id = creator_id
     
-    async def on_submit(self, interaction: discord.Interaction):
-        user_input = str(self.user).strip()
-        user = None
-        
-        # Try to parse as mention
-        if user_input.startswith("<@") and user_input.endswith(">"):
-            user_id = user_input[2:-1].replace("!", "")  # Remove ! if present
-            if user_id.isdigit():
-                user = interaction.guild.get_member(int(user_id))
-        # Try to parse as ID
-        elif user_input.isdigit():
-            user = interaction.guild.get_member(int(user_input))
-        # Try to find by name
-        else:
-            user = discord.utils.find(
-                lambda m: user_input.lower() in m.display_name.lower() or 
-                         user_input.lower() in m.name.lower(),
-                interaction.guild.members
+    @ui.button(label="🗑️ Delete Ticket", style=discord.ButtonStyle.red, custom_id="delete_ticket")
+    async def delete_ticket(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.defer()
+        try:
+            await self.channel.delete(reason="Ticket deleted via panel")
+        except discord.Forbidden:
+            await interaction.followup.send("❌ Bot doesn't have permission to delete this channel!", ephemeral=True)
+    
+    @ui.button(label="📥 Download Transcript", style=discord.ButtonStyle.gray, custom_id="download_transcript")
+    async def download_transcript(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            transcript = await create_transcript(self.channel)
+            await interaction.user.send(
+                f"Transcript for ticket #{self.channel.name}:",
+                file=discord.File(transcript, filename=f"transcript-{self.channel.name}.txt")
             )
+            os.remove(transcript)
+            await interaction.followup.send("✅ Transcript sent to your DMs!", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.followup.send("❌ Couldn't send DM. Please check your privacy settings.", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error generating transcript: {str(e)}", ephemeral=True)
+    
+    @ui.button(label="📩 DM Transcript to User", style=discord.ButtonStyle.green, custom_id="dm_transcript")
+    async def dm_transcript_to_user(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.defer()
+        try:
+            creator = await interaction.guild.fetch_member(self.creator_id)
+            transcript = await create_transcript(self.channel)
+            
+            await creator.send(
+                f"Transcript for your ticket in {interaction.guild.name}:",
+                file=discord.File(transcript, filename=f"transcript-{self.channel.name}.txt")
+            )
+            os.remove(transcript)
+            
+            await interaction.followup.send(f"✅ Transcript sent to {creator.mention}!")
+            await log_action(interaction.guild.id, 
+                           f"Transcript for #{self.channel.name} sent to {creator} by {interaction.user}")
+        except discord.Forbidden:
+            await interaction.followup.send(f"❌ Couldn't send DM to user.", ephemeral=True)
+        except discord.NotFound:
+            await interaction.followup.send("❌ User not found in the server.", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+# Simple ticket creation (no modal)
+class SimpleTicketView(ui.View):
+    def __init__(self, panel_id: int):
+        super().__init__(timeout=None)
+        self.panel_id = panel_id
+    
+    @ui.button(label="Create Ticket", style=discord.ButtonStyle.green, custom_id="simple_ticket_create")
+    async def create_simple_ticket(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.defer(ephemeral=True)
         
-        if not user:
+        if not await check_panel_permission(interaction, panel_id=self.panel_id):
             await send_popup(
                 interaction,
-                "❌ User Not Found",
-                "Could not find the specified user!",
+                "❌ Permission Denied",
+                "You don't have permission to create tickets!",
                 is_error=True
             )
             return
         
-        try:
-            await interaction.channel.set_permissions(user, read_messages=True, send_messages=True)
-            await interaction.response.send_message(
-                f"✅ {user.mention} has been added to the ticket",
-                allowed_mentions=discord.AllowedMentions.none()
-            )
-        except discord.Forbidden:
-            await send_popup(
-                interaction,
-                "❌ Permission Error",
-                "Bot doesn't have permission to edit channel permissions!",
-                is_error=True
-            )
+        # Create simple ticket data
+        custom_data = {
+            "title": "Support Ticket",
+            "fields": {"Description": "Created via simple panel"},
+            "attachments": []
+        }
+        await create_advanced_ticket(interaction, custom_data, panel_id=self.panel_id)
 
-class PriorityView(ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)  # Set timeout to None to make it persistent
-        for label, priority in PRIORITIES.items():
-            self.add_item(PriorityButton(label, priority))
-
-class PriorityButton(ui.Button):
-    def __init__(self, label, priority):
-        super().__init__(
-            label=label,
-            style=discord.ButtonStyle.gray,
-            custom_id=f"priority_{priority}"  # custom_id is required for persistence
-        )
-        self.priority = priority
-        self.label_text = label
-        
-    async def callback(self, interaction: discord.Interaction):
-        c.execute("UPDATE tickets SET priority = ? WHERE channel_id = ?",
-                  (self.priority, interaction.channel.id))
-        conn.commit()
-        
-        embed = interaction.message.embeds[0]
-        for i, field in enumerate(embed.fields):
-            if field.name == "Priority":
-                embed.set_field_at(i, name="Priority", value=self.label_text, inline=True)
-                break
-        
-        await interaction.message.edit(embed=embed)
-        await interaction.response.send_message(f"✅ Priority set to {self.label_text}", ephemeral=True)
-
-# Command to create a ticket panel
-@bot.tree.command(name="createpanel", description="Create a custom ticket panel")
+# Command to create a simple ticket panel
+@bot.tree.command(name="createpanel_simple", description="Create a simple ticket panel (no modal)")
 @app_commands.default_permissions(administrator=True)
-async def create_panel(
+async def create_simple_panel(
     interaction: discord.Interaction,
     channel: discord.TextChannel,
     title: str,
@@ -600,19 +583,11 @@ async def create_panel(
     )
     
     # Create the view with button
-    view = ui.View(timeout=None)
-    
-    async def panel_callback(i: discord.Interaction):
-        await i.response.send_modal(AdvancedTicketModal(panel_id=panel_id))
-    
-    button = ui.Button(
-        label=button_label,
-        emoji=button_emoji,
-        style=button_style,
-        custom_id=f"panel_{panel_id}"
-    )
-    button.callback = panel_callback
-    view.add_item(button)
+    view = SimpleTicketView(panel_id=panel_id)
+    button = view.create_simple_ticket
+    button.label = button_label
+    button.emoji = button_emoji
+    button.style = button_style
     
     # Send the panel
     try:
@@ -633,7 +608,7 @@ async def create_panel(
     await send_popup(
         interaction, 
         "✅ Panel Created", 
-        f"Ticket panel successfully created in {channel.mention}!"
+        f"Simple ticket panel successfully created in {channel.mention}!"
     )
 
 # Command to create a ticket preset
