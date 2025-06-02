@@ -540,6 +540,12 @@ class SimpleTicketView(ui.View):
         }
         await create_advanced_ticket(interaction, custom_data, panel_id=self.panel_id)
 
+@bot.command()
+@commands.is_owner()
+async def sync(ctx):
+    await bot.tree.sync()
+    await ctx.send("Commands synced!")
+
 # Command to create a simple ticket panel
 @bot.tree.command(name="createpanel_simple", description="Create a simple ticket panel (no modal)")
 @app_commands.default_permissions(administrator=True)
