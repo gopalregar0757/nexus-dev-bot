@@ -717,10 +717,9 @@ async def create_ticket_preset(
 # Command to create a ticket from a preset
 @bot.tree.command(name="ticket", description="Create a ticket from a preset")
 async def create_ticket_from_preset(interaction: discord.Interaction, preset: str):
-    await interaction.response.defer(ephemeral=True)
-    
+    # Don't defer here - we need to respond with a modal immediately
     c.execute("SELECT preset_id FROM ticket_presets WHERE guild_id = ? AND name = ?", 
-            (interaction.guild.id, preset.lower()))
+              (interaction.guild.id, preset.lower()))
     result = c.fetchone()
     
     if not result:
@@ -742,7 +741,8 @@ async def create_ticket_from_preset(interaction: discord.Interaction, preset: st
         )
         return
     
-    await interaction.followup.send_modal(AdvancedTicketModal(preset_id=preset_id))
+    # Send the modal as the initial response
+    await interaction.response.send_modal(AdvancedTicketModal(preset_id=preset_id))
 
 # Command to list available presets
 @bot.tree.command(name="listpresets", description="List available ticket presets")
